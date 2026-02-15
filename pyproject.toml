@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "genesis-kernel"
+version = "0.1.0"
+description = "AVX-512 fused NF4 dequant+matmul kernels for LLM inference on CPU"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.urls]
+Homepage = "https://github.com/Anuar81/genesis-kernel"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["genesis_kernel*"]
