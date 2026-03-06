@@ -10,7 +10,7 @@ Q4_K turbo7 kernel: ggml-compatible `vec_dot_q4_K_q8_K` replacement.
   (5,000 random attempts, 3-stage verification: measure → re-measure × 5 → A/B × 20)
 - Bit-exact output vs ggml (`diff = 0.000000e+00` for N=1 to N=1024)
 - Isolated benchmark vs ggml (llama.cpp b8184, Ryzen 9 7900):
-  - N=32: 5.51 vs 5.59 ns/blk (+1.46%)
+  - N=32: 32.05 vs 36.59 ns/blk (+12.56%)
   - N=128: 11.69 vs 12.85 ns/blk (+9.05%)
   - N=512: 6.40 vs 6.56 ns/blk (+2.52%)
   - N=1024: 5.51 vs 5.59 ns/blk (+1.46%)

@@ -10,7 +10,7 @@ Built with AI assistance + reverse engineering of ggml internals. The NF4 kernel
 
 ## Reproduce in 5 Minutes
 
-Requirements: Linux x86-64, Python 3.10+, CPU with AVX-512 (AMD Zen 4+, Intel Skylake-X+).
+Requirements: Linux x86-64, Python 3.10+, CPU with AVX-512. NF4 kernels need AVX-512F only (AMD Zen 4+, Intel Skylake-X+). Q4_K turbo7 also needs VNNI (AMD Zen 4+, Intel Ice Lake+).
 
 ```bash
 # Check AVX-512 support
@@ -182,7 +182,11 @@ GENESIS_VERBOSE=1 LD_PRELOAD=./genesis_turbo7.so llama-cli -m model.gguf -p "Hel
 
 The `.so` intercepts `ggml_vec_dot_q4_K_q8_K_generic` — the non-repacked path that handles standard `block_q4_K` data. Tested with llama.cpp b8184.
 
-**Important: disabling repack may be required.** llama.cpp has a repack system (`ggml_backend_cpu_repack_buffer_type` in `ggml/src/ggml-cpu/repack.cpp`) that converts `block_q4_K` into an interleaved `block_q4_Kx8` format for optimized GEMM. When repack is active, some code paths may bypass `_generic` entirely, meaning our kernel never gets called. During our testing we had to disable repack to get consistent results:
+**Known limitation: llama.cpp's repack system.** llama.cpp has a repack system (`ggml_backend_cpu_repack_buffer_type` in `ggml/src/ggml-cpu/repack.cpp`) that converts `block_q4_K` into an interleaved `block_q4_Kx8` format for optimized GEMM. When repack is active, some code paths bypass `_generic` entirely, meaning our kernel never gets called.
+
+How to detect: run with `GENESIS_VERBOSE=1`. If you don't see `[genesis] turbo7 loaded: 1078 bytes at 0x...` in the output, the repack path is active and our kernel is not being used.
+
+During our testing (llama.cpp b8184) we had to disable repack to get consistent results:
 
 ```bash
 # In your llama.cpp source directory, disable repack:
@@ -203,6 +207,8 @@ cmake --build build -j$(nproc)
 ```
 
 Without this patch, `LD_PRELOAD` may still work for some operations, but the repacked GEMM path will use ggml's own kernel instead of ours. Our benchmarks were run with repack disabled.
+
+Roadmap: supporting the repacked `block_q4_Kx8` path directly is on our radar but not promised. Contributions welcome.
 
 ## How It Works
 
@@ -264,7 +270,7 @@ A: b8184. GCC 14.2.1 with `-march=native`. The ggml function `ggml_vec_dot_q4_K_
 A: We pin to core 0 (`taskset -c 0`), set governor to `performance`, and run enough repetitions (20,000 per round, 20 rounds) that timer resolution is irrelevant. Raw data available for independent analysis.
 
 **Q: Does this work on Intel?**
-A: Should work on any CPU with AVX-512F + VNNI (Intel Ice Lake+, Sapphire Rapids, etc.). Only tested on AMD Zen 4. Intel benchmarks welcome as PRs.
+A: NF4 kernels need AVX-512F only (Skylake-X, Cannon Lake, and later). Q4_K turbo7 also needs AVX-512 VNNI (Ice Lake+, Sapphire Rapids, etc.). Only tested on AMD Zen 4. Intel benchmarks welcome as PRs.
 
 **Q: Is this "genetic programming" / "evolutionary AI"?**
 A: The NF4 kernels: yes, instruction orderings were evolved over 16,460 mutations (swap, insert, delete, replace). The Q4_K kernel: no, it was hand-engineered through 7 iterations with AI assistance. The final prefetch hint was found by brute force (5,000 random injections, not evolution).
@@ -327,7 +333,7 @@ Construido con asistencia de IA + ingeniería inversa de ggml. Los kernels NF4 f
 
 ## Reproducir en 5 Minutos
 
-Requisitos: Linux x86-64, Python 3.10+, CPU con AVX-512 (AMD Zen 4+, Intel Skylake-X+).
+Requisitos: Linux x86-64, Python 3.10+, CPU con AVX-512. Los kernels NF4 necesitan solo AVX-512F (AMD Zen 4+, Intel Skylake-X+). Q4_K turbo7 también necesita VNNI (AMD Zen 4+, Intel Ice Lake+).
 
 ```bash
 # Verificar soporte AVX-512
@@ -496,7 +502,11 @@ GENESIS_VERBOSE=1 LD_PRELOAD=./genesis_turbo7.so llama-cli -m model.gguf -p "Hol
 # Debería imprimir: [genesis] turbo7 loaded: 1078 bytes at 0x...
 ```
 
-**Importante: puede ser necesario desactivar repack.** llama.cpp tiene un sistema de repack que convierte `block_q4_K` a formato intercalado `block_q4_Kx8`. Cuando está activo, algunos paths no pasan por `_generic` y nuestro kernel no se ejecuta. En nuestras pruebas tuvimos que desactivarlo:
+**Limitación conocida: sistema de repack de llama.cpp.** llama.cpp tiene un sistema de repack que convierte `block_q4_K` a formato intercalado `block_q4_Kx8`. Cuando está activo, algunos paths no pasan por `_generic` y nuestro kernel no se ejecuta.
+
+Cómo detectar: correr con `GENESIS_VERBOSE=1`. Si no ves `[genesis] turbo7 loaded: 1078 bytes at 0x...` en la salida, el path de repack está activo y nuestro kernel no se está usando.
+
+En nuestras pruebas (llama.cpp b8184) tuvimos que desactivar repack para obtener resultados consistentes:
 
 ```bash
 # En el directorio de llama.cpp, desactivar repack:
@@ -515,6 +525,10 @@ LD_PRELOAD=./genesis_turbo7.so llama-cli -m model.gguf -p "Hola" -n 128
 git checkout ggml/src/ggml-cpu/repack.cpp
 cmake --build build -j$(nproc)
 ```
+
+Sin este parche, `LD_PRELOAD` puede funcionar para algunas operaciones, pero el path repacked usará el kernel de ggml en vez del nuestro. Nuestros benchmarks se corrieron con repack desactivado.
+
+Roadmap: soportar el path repacked `block_q4_Kx8` directamente está en nuestro radar pero no prometido. Contribuciones bienvenidas.
 
 ## Cómo Funciona
 
@@ -571,7 +585,7 @@ R: Sí. Necesitás una CPU con AVX-512 (idealmente Zen 4 para resultados compara
 R: b8184. GCC 14.2.1 con `-march=native`. La función ggml `ggml_vec_dot_q4_K_q8_K_generic` compila a instrucciones AVX-512 VNNI + VBMI a pesar de su nombre "generic" — verificado con `objdump`.
 
 **P: ¿Funciona en Intel?**
-R: Debería funcionar en cualquier CPU con AVX-512F + VNNI (Intel Ice Lake+, Sapphire Rapids, etc.). Solo testeado en AMD Zen 4. PRs con benchmarks de Intel son bienvenidos.
+R: Los kernels NF4 necesitan solo AVX-512F (Skylake-X, Cannon Lake, y posteriores). Q4_K turbo7 también necesita AVX-512 VNNI (Ice Lake+, Sapphire Rapids, etc.). Solo testeado en AMD Zen 4. PRs con benchmarks de Intel son bienvenidos.
 
 **P: ¿Es "programación genética" / "IA evolutiva"?**
 R: Los kernels NF4: sí, los ordenamientos de instrucciones fueron evolucionados en 16,460 mutaciones. El kernel Q4_K: no, fue diseñado a mano en 7 iteraciones con asistencia de IA. El prefetch final fue encontrado por fuerza bruta (5,000 inyecciones aleatorias, no evolución).

@@ -41,4 +41,4 @@ pytest tests/ -v
 
 - Linux x86-64
 - Python 3.10+, NumPy
-- CPU with AVX-512 (AMD Zen 4+, Intel Ice Lake+)
+- CPU with AVX-512 (AMD Zen 4+, Intel Skylake-X+ for NF4; Intel Ice Lake+ for Q4_K VNNI)
