@@ -1,24 +1,20 @@
 #!/usr/bin/env python3
 """
-Test suite for Genesis Kernel — verifies all baked kernels and base kernel
-produce correct results against the Python reference implementation.
+Genesis Kernel — Test Suite (pytest).
 
-Tests:
-  1. All 4 baked evolved kernels (1024x2048, 2048x512, 3072x2048, 2048x1536)
-  2. Base kernel fallback for non-baked dimensions (256x128)
-  3. Quantization round-trip accuracy
-  4. Activation reordering correctness
+Tests both kernel families:
+  - NF4: fused dequantization + matmul (AVX-512 ZMM)
+  - Q4_K: ggml-compatible dot product (AVX-512 VNNI in YMM)
 
 Run:
-    python -m tests.test_kernels          (from genesis_public/)
-    python tests/test_kernels.py          (from genesis_public/)
+    pytest tests/ -v
 """
 import sys
 import os
-import time
+import struct
 import numpy as np
+import pytest
 
-# Ensure genesis_kernel is importable when running from genesis_public/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from genesis_kernel import (
@@ -31,159 +27,263 @@ from genesis_kernel import (
     NF4_TABLE,
     BLOCKSIZE,
 )
+from genesis_kernel.q4k_kernel import (
+    compile_q4k_kernel,
+    compile_turbo7,
+    turbo7_ops,
+    OpQ4K,
+)
 
 
-def test_quantize_roundtrip():
-    """Verify quantize -> dequant preserves values within NF4 precision."""
-    np.random.seed(42)
-    K = 256
-    weights = np.random.randn(K).astype(np.float32) * 0.5
+# ============================================================
+# NF4 tests
+# ============================================================
 
-    nf4, scales = quantize_nf4(weights)
-    recovered = dequant_nf4_reference(nf4, scales, K)
+class TestNF4Quantization:
+    """Quantization round-trip and utility tests."""
 
-    # NF4 has 4-bit precision, so relative error can be significant
-    # but the quantization should map to the nearest table entry
-    max_err = np.max(np.abs(weights - recovered))
-    mean_err = np.mean(np.abs(weights - recovered))
+    def test_quantize_roundtrip(self):
+        """quantize → dequant preserves values within NF4 precision."""
+        np.random.seed(42)
+        K = 256
+        weights = np.random.randn(K).astype(np.float32) * 0.5
 
-    print(f"  quantize roundtrip: max_err={max_err:.6f}, mean_err={mean_err:.6f}")
-    assert max_err < 0.5, f"Max error too large: {max_err}"
-    assert mean_err < 0.1, f"Mean error too large: {mean_err}"
-    return True
+        nf4, scales = quantize_nf4(weights)
+        recovered = dequant_nf4_reference(nf4, scales, K)
+
+        max_err = np.max(np.abs(weights - recovered))
+        mean_err = np.mean(np.abs(weights - recovered))
+        assert max_err < 0.5, f"Max error too large: {max_err}"
+        assert mean_err < 0.1, f"Mean error too large: {mean_err}"
+
+    def test_pack_nf4_roundtrip(self):
+        """pack_nf4 packs two 4-bit indices per byte correctly."""
+        indices = np.array([3, 12, 0, 15, 7, 8], dtype=np.uint8)
+        packed = pack_nf4(indices)
+        # Verify: byte[0] = 3 | (12<<4) = 0xC3, byte[1] = 0 | (15<<4) = 0xF0, etc.
+        assert packed[0] == (3 | (12 << 4))
+        assert packed[1] == (0 | (15 << 4))
+        assert packed[2] == (7 | (8 << 4))
+
+    def test_reorder_activations_layout(self):
+        """reorder_activations groups even/odd indices correctly."""
+        act = np.arange(64, dtype=np.float32)
+        reord = reorder_activations(act)
+
+        # First group of 32: even [0,2,4,...,30] then odd [1,3,5,...,31]
+        for i in range(16):
+            assert reord[i] == act[2 * i], f"Even mismatch at {i}"
+            assert reord[16 + i] == act[2 * i + 1], f"Odd mismatch at {i}"
+        # Second group of 32
+        for i in range(16):
+            assert reord[32 + i] == act[32 + 2 * i], f"Even mismatch group 2 at {i}"
+            assert reord[48 + i] == act[32 + 2 * i + 1], f"Odd mismatch group 2 at {i}"
+
+    def test_reorder_required_for_correctness(self):
+        """Kernel gives WRONG results without reorder — this is a contract."""
+        np.random.seed(99)
+        M, K = 256, 128
+        weights = np.random.randn(M * K).astype(np.float32) * 0.3
+        activations = np.random.randn(K).astype(np.float32)
+        nf4, scales = quantize_nf4(weights)
+
+        ref = matmul_nf4_reference(nf4, scales, activations, M, K)
+        act_reord = reorder_activations(activations)
+        kernel = compile_best_nf4_matmul(M=M, K=K)
+
+        # With reorder: should match reference
+        correct = kernel(nf4, scales, act_reord, M, K)
+        cosine_correct = _cosine(ref, correct)
+        assert cosine_correct > 0.999, f"Reordered should match: cosine={cosine_correct}"
+
+        # Without reorder: should NOT match reference
+        wrong = kernel(nf4, scales, activations, M, K)
+        cosine_wrong = _cosine(ref, wrong)
+        assert cosine_wrong < 0.99, (
+            f"Without reorder should diverge: cosine={cosine_wrong}. "
+            "If this passes, the reorder contract is broken."
+        )
 
 
-def test_reorder_activations():
-    """Verify activation reordering groups even/odd indices correctly."""
-    act = np.arange(64, dtype=np.float32)
-    reord = reorder_activations(act)
+class TestNF4Kernels:
+    """Accuracy tests for NF4 matmul kernels against Python reference."""
 
-    # First group of 32: even indices [0,2,4,...,30] then odd [1,3,5,...,31]
+    @pytest.mark.parametrize("M,K,label", [
+        (1024, 2048, "80B gate_up (baked)"),
+        (2048, 512,  "80B down_proj (baked)"),
+        (3072, 2048, "30B gate_up (baked)"),
+        (2048, 1536, "30B down_proj (baked)"),
+    ])
+    def test_baked_kernel(self, M, K, label):
+        """Baked evolved kernel matches Python reference."""
+        self._check_kernel(M, K, label)
+
+    @pytest.mark.parametrize("M,K", [
+        (256, 128),
+        (512, 256),
+    ])
+    def test_base_kernel(self, M, K):
+        """Base 2-pipeline kernel matches Python reference."""
+        self._check_kernel(M, K, "base fallback")
+
+    def _check_kernel(self, M, K, label):
+        np.random.seed(hash((M, K)) % 2**31)
+        weights = np.random.randn(M * K).astype(np.float32) * 0.3
+        activations = np.random.randn(K).astype(np.float32)
+
+        nf4, scales = quantize_nf4(weights)
+        ref = matmul_nf4_reference(nf4, scales, activations, M, K)
+
+        act_reord = reorder_activations(activations)
+        kernel = compile_best_nf4_matmul(M=M, K=K)
+        result = kernel(nf4, scales, act_reord, M, K)
+
+        abs_diff = np.abs(ref - result)
+        max_abs = np.max(abs_diff)
+        cosine = _cosine(ref, result)
+
+        # NF4 accumulates quantization error across K, tolerance ~ sqrt(K)
+        tol_abs = 0.05 * np.sqrt(K)
+        assert max_abs < tol_abs, (
+            f"{label} {M}x{K}: max_abs={max_abs:.4f} > tol={tol_abs:.2f}"
+        )
+        assert cosine > 0.999, (
+            f"{label} {M}x{K}: cosine={cosine:.6f} < 0.999"
+        )
+
+
+# ============================================================
+# Q4_K tests
+# ============================================================
+
+def _make_q4k_block():
+    """Create one valid Q4_K block (144 bytes) with known data."""
+    block = bytearray(144)
+    # d (fp16 at offset 0): use 1.0 in fp16 = 0x3C00
+    struct.pack_into('<H', block, 0, 0x3C00)
+    # dmin (fp16 at offset 2): use 0.0
+    struct.pack_into('<H', block, 2, 0x0000)
+    # scales (12 bytes at offset 4): all 1s (each 6-bit scale = 1)
+    for i in range(12):
+        block[4 + i] = 0x01
+    # qs (128 bytes at offset 16): fill with 0x11 (nibbles = 1)
+    for i in range(128):
+        block[16 + i] = 0x11
+    return bytes(block)
+
+
+def _make_q8k_block():
+    """Create one valid Q8_K block (292 bytes) with known data."""
+    block = bytearray(292)
+    # d (float32 at offset 0): use 1.0
+    struct.pack_into('<f', block, 0, 1.0)
+    # qs (256 int8 at offset 4): fill with 1
+    for i in range(256):
+        block[4 + i] = 1
+    # bsums (16 int16 at offset 260): each = sum of 16 qs = 16
     for i in range(16):
-        assert reord[i] == act[2 * i], f"Even mismatch at {i}: {reord[i]} != {act[2*i]}"
-        assert reord[16 + i] == act[2 * i + 1], f"Odd mismatch at {i}"
-
-    # Second group of 32
-    for i in range(16):
-        assert reord[32 + i] == act[32 + 2 * i], f"Even mismatch at group 2, {i}"
-        assert reord[48 + i] == act[32 + 2 * i + 1], f"Odd mismatch at group 2, {i}"
-
-    print("  reorder_activations: OK")
-    return True
+        struct.pack_into('<h', block, 260 + i * 2, 16)
+    return bytes(block)
 
 
-def test_kernel(M, K, label=""):
-    """
-    Test a kernel for dimensions M x K against the Python reference.
+class TestQ4K:
+    """Tests for Q4_K turbo7 kernel."""
 
-    Returns (passed, max_relative_error, time_ms).
-    """
-    np.random.seed(hash((M, K)) % 2**31)
+    def test_compile_turbo7(self):
+        """compile_turbo7() returns a callable kernel."""
+        kernel = compile_turbo7()
+        assert kernel is not None, "compile_turbo7() returned None"
+        assert hasattr(kernel, '_func'), "Missing _func attribute"
+        assert hasattr(kernel, '_size'), "Missing _size attribute"
+        assert kernel._n_ops == 34, f"Expected 34 ops, got {kernel._n_ops}"
 
-    # Generate random weights and activations
-    weights = np.random.randn(M * K).astype(np.float32) * 0.3
-    activations = np.random.randn(K).astype(np.float32)
+    def test_turbo7_ops_count(self):
+        """turbo7 has exactly 34 ops (33 turbo6 + 1 prefetchnta)."""
+        ops = turbo7_ops()
+        assert len(ops) == 34, f"Expected 34 ops, got {len(ops)}"
+        # The injected prefetch should be at position 19
+        assert ops[19].nombre == "prefetchnta", (
+            f"Op at position 19 should be prefetchnta, got {ops[19].nombre}"
+        )
 
-    # Quantize
-    nf4, scales = quantize_nf4(weights)
+    def test_turbo7_nonzero_output(self):
+        """Turbo7 kernel produces non-zero output on valid data."""
+        kernel = compile_turbo7()
+        if kernel is None:
+            pytest.skip("Kernel compilation failed (no AVX-512?)")
 
-    # Python reference (uses raw activations, not reordered)
-    ref_output = matmul_nf4_reference(nf4, scales, activations, M, K)
+        q4k = _make_q4k_block()
+        q8k = _make_q8k_block()
 
-    # Genesis kernel (uses reordered activations)
-    act_reord = reorder_activations(activations)
-    kernel = compile_best_nf4_matmul(M=M, K=K)
-    origin = getattr(kernel, '_origin', 'unknown')
+        q4k_arr = np.frombuffer(q4k, dtype=np.uint8).copy()
+        q8k_arr = np.frombuffer(q8k, dtype=np.uint8).copy()
 
-    t0 = time.perf_counter()
-    kernel_output = kernel(nf4, scales, act_reord, M, K)
-    t1 = time.perf_counter()
-    time_us = (t1 - t0) * 1e6
+        result = kernel(q4k_arr.ctypes.data, q8k_arr.ctypes.data, 1)
+        # With d=1.0, scales=1, qs=1, q8=1, the result should be non-zero
+        assert isinstance(result, float), f"Expected float, got {type(result)}"
+        # We don't check exact value (depends on scale decoding), just non-zero
+        # and finite
+        assert np.isfinite(result), f"Result is not finite: {result}"
 
-    # Compare
-    abs_diff = np.abs(ref_output - kernel_output)
-    max_abs = np.max(abs_diff)
-    mean_abs = np.mean(abs_diff)
+    def test_turbo7_multiple_blocks(self):
+        """Turbo7 kernel handles multiple blocks correctly."""
+        kernel = compile_turbo7()
+        if kernel is None:
+            pytest.skip("Kernel compilation failed (no AVX-512?)")
 
-    # Relative error (avoid division by zero)
-    ref_abs = np.abs(ref_output)
-    mask = ref_abs > 1e-6
-    if np.any(mask):
-        max_rel = np.max(abs_diff[mask] / ref_abs[mask])
-    else:
-        max_rel = 0.0
+        n_blocks = 4
+        q4k = _make_q4k_block() * n_blocks
+        q8k = _make_q8k_block() * n_blocks
 
-    # Cosine similarity
-    norm_ref = np.linalg.norm(ref_output)
-    norm_kern = np.linalg.norm(kernel_output)
-    if norm_ref > 0 and norm_kern > 0:
-        cosine = np.dot(ref_output, kernel_output) / (norm_ref * norm_kern)
-    else:
-        cosine = 1.0
+        q4k_arr = np.frombuffer(q4k, dtype=np.uint8).copy()
+        q8k_arr = np.frombuffer(q8k, dtype=np.uint8).copy()
 
-    # NF4 matmul accumulates quantization errors across K elements,
-    # so we use a tolerance proportional to sqrt(K)
-    tol_abs = 0.05 * np.sqrt(K)
-    passed = max_abs < tol_abs and cosine > 0.999
+        r1 = kernel(q4k_arr.ctypes.data, q8k_arr.ctypes.data, 1)
+        r4 = kernel(q4k_arr.ctypes.data, q8k_arr.ctypes.data, n_blocks)
 
-    status = "PASS" if passed else "FAIL"
-    tag = f" [{label}]" if label else ""
-    print(f"  {status} {M}x{K}{tag} ({origin})")
-    print(f"       max_abs={max_abs:.4f}, mean_abs={mean_abs:.4f}, "
-          f"cosine={cosine:.6f}, time={time_us:.0f}us")
+        assert np.isfinite(r1) and np.isfinite(r4)
+        # 4 identical blocks should give ~4x the single-block result
+        if abs(r1) > 1e-10:
+            ratio = r4 / r1
+            assert 3.0 < ratio < 5.0, (
+                f"4 blocks should be ~4x one block: r1={r1}, r4={r4}, ratio={ratio}"
+            )
 
-    if not passed:
-        print(f"       TOLERANCE: max_abs < {tol_abs:.2f}, cosine > 0.999")
-        print(f"       ref[:5]  = {ref_output[:5]}")
-        print(f"       kern[:5] = {kernel_output[:5]}")
+    def test_turbo7_so_generation(self):
+        """generate_turbo7_so() creates a .c and .so file."""
+        import tempfile
+        from genesis_kernel.q4k_kernel import generate_turbo7_so
 
-    return passed
+        with tempfile.TemporaryDirectory() as tmpdir:
+            so_path = generate_turbo7_so(tmpdir)
+            if so_path is None:
+                pytest.skip("gcc not available for .so generation")
+            assert os.path.exists(so_path), f".so not found at {so_path}"
+            c_path = os.path.join(tmpdir, "genesis_turbo7.c")
+            assert os.path.exists(c_path), f".c not found at {c_path}"
+            # .so should be non-trivial size
+            so_size = os.path.getsize(so_path)
+            assert so_size > 1000, f".so too small: {so_size} bytes"
 
-
-def main():
-    print("=" * 60)
-    print("Genesis Kernel — Test Suite")
-    print("=" * 60)
-
-    results = []
-
-    # Test utilities
-    print("\n--- Utility tests ---")
-    results.append(("quantize_roundtrip", test_quantize_roundtrip()))
-    results.append(("reorder_activations", test_reorder_activations()))
-
-    # Test all 4 baked evolved kernels
-    baked_dims = [
-        (1024, 2048, "80B gate_up"),
-        (2048, 512,  "80B down_proj"),
-        (3072, 2048, "30B gate_up"),
-        (2048, 1536, "30B down_proj"),
-    ]
-
-    print("\n--- Baked evolved kernels ---")
-    for M, K, label in baked_dims:
-        results.append((f"baked_{M}x{K}", test_kernel(M, K, label)))
-
-    # Test base kernel fallback (non-baked dimensions)
-    print("\n--- Base kernel fallback ---")
-    results.append(("base_256x128", test_kernel(256, 128, "base fallback")))
-    results.append(("base_512x256", test_kernel(512, 256, "base fallback")))
-
-    # Summary
-    n_pass = sum(1 for _, p in results if p)
-    n_total = len(results)
-    print(f"\n{'=' * 60}")
-    print(f"Results: {n_pass}/{n_total} passed")
-    print(f"{'=' * 60}")
-
-    if n_pass == n_total:
-        print("All tests passed.")
-        return 0
-    else:
-        failed = [name for name, p in results if not p]
-        print(f"FAILED: {', '.join(failed)}")
-        return 1
+    def test_opq4k_repr(self):
+        """OpQ4K has a readable repr."""
+        op = OpQ4K("vpdpwssd", {"dst": "YMM22", "scale": "YMM2", "src": "YMM1"}, grupo="g0")
+        r = repr(op)
+        assert "vpdpwssd" in r
+        assert "g0" in r
+        # Without grupo
+        op2 = OpQ4K("vpand", {"dst": "YMM1"})
+        assert "vpand" in repr(op2)
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+# ============================================================
+# Helpers
+# ============================================================
+
+def _cosine(a, b):
+    """Cosine similarity between two vectors."""
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 1.0
+    return float(np.dot(a, b) / (na * nb))

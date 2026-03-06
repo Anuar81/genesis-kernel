@@ -4,8 +4,8 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "genesis-kernel"
-version = "0.1.0"
-description = "AVX-512 fused NF4 dequant+matmul kernels for LLM inference on CPU"
+version = "0.2.0"
+description = "JIT x86-64 kernels for LLM inference: NF4 matmul + Q4_K dot product (AVX-512)"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"

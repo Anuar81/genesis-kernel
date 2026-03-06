@@ -1,22 +1,22 @@
 """
-Genesis Kernel — AVX-512 fused NF4 dequant+matmul for LLM inference.
+Genesis Kernel — JIT x86-64 kernels for LLM inference.
 
-Provides JIT-compiled x86-64 kernels that fuse NF4 dequantization with
-matrix multiplication, enabling fast CPU inference for 4-bit quantized
-language models. Includes dimension-specific kernels discovered through
-genetic evolution of instruction orderings.
+Two kernel families:
+  - NF4: Fused dequantization + matrix multiplication (AVX-512 ZMM)
+  - Q4_K: ggml-compatible dot product (AVX-512 VNNI in YMM)
 
-Quick start:
+Quick start (NF4):
     from genesis_kernel import compile_best_nf4_matmul, quantize_nf4, reorder_activations
-
-    nf4_weights, scales = quantize_nf4(weights_float32)
-    act_reord = reorder_activations(activations_float32)
     kernel = compile_best_nf4_matmul(M=2048, K=1536)
-    output = kernel(nf4_weights, scales, act_reord, M=2048, K=1536)
+
+Quick start (Q4_K):
+    from genesis_kernel import compile_turbo7, generate_turbo7_so
+    kernel = compile_turbo7()
+    # Or generate .so for llama.cpp:
+    generate_turbo7_so(".")
 """
 
 from .nf4_kernel import (
-    # Public API
     compile_best_nf4_matmul,
     compile_nf4_matmul,
     generate_nf4_matmul_kernel,
@@ -27,7 +27,7 @@ from .nf4_kernel import (
     matmul_nf4_reference,
     NF4_TABLE,
     BLOCKSIZE,
-    # Backward-compatible aliases (Spanish)
+    # Backward-compatible aliases
     compilar_mejor_nf4_matmul,
     compilar_nf4_matmul,
     generar_kernel_nf4_matmul,
@@ -38,10 +38,20 @@ from .nf4_kernel import (
     NF4_TABLA,
 )
 
+from .q4k_kernel import (
+    compile_q4k_kernel,
+    compile_turbo7,
+    generate_q4k_kernel,
+    generate_turbo7_so,
+    turbo7_ops,
+    OpQ4K,
+)
+
 from .x86_emitter import X86Emitter
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
+    # NF4
     "compile_best_nf4_matmul",
     "compile_nf4_matmul",
     "generate_nf4_matmul_kernel",
@@ -52,5 +62,13 @@ __all__ = [
     "matmul_nf4_reference",
     "NF4_TABLE",
     "BLOCKSIZE",
+    # Q4_K
+    "compile_q4k_kernel",
+    "compile_turbo7",
+    "generate_q4k_kernel",
+    "generate_turbo7_so",
+    "turbo7_ops",
+    "OpQ4K",
+    # Emitter
     "X86Emitter",
 ]

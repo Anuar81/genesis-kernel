@@ -734,3 +734,489 @@ class X86Emitter:
     def size(self) -> int:
         """Size of generated code in bytes."""
         return len(self.code)
+
+    # ================================================================
+    # EVEX DISP_N HELPER — Generic displacement compression
+    # ================================================================
+
+    def _evex_mem_modrm_sib_disp_n(self, reg: int, base: int, offset: int, disp_n: int):
+        """
+        Emit ModRM (+SIB if needed) for EVEX memory access with generic
+        displacement compression. disp_n is the compression factor
+        (1, 2, 4, 8, 16, 32, 64) depending on the instruction's operand size.
+        """
+        needs_sib = (base & 7) == 4
+        rbp_base = (base & 7) == 5
+
+        if offset == 0 and not rbp_base:
+            self._modrm(0b00, reg, base)
+            if needs_sib:
+                self._emit(0x24)
+        elif offset != 0 and (offset % disp_n == 0) and (-128 <= offset // disp_n <= 127):
+            self._modrm(0b01, reg, base)
+            if needs_sib:
+                self._emit(0x24)
+            self._emit((offset // disp_n) & 0xFF)
+        else:
+            self._modrm(0b10, reg, base)
+            if needs_sib:
+                self._emit(0x24)
+            self._emit_bytes(struct.pack("<i", offset))
+
+    # ================================================================
+    # VEX 3-BYTE PREFIX INFRASTRUCTURE
+    # ================================================================
+    # VEX encoding is 2-3 bytes more compact than EVEX (4 bytes).
+    # Format: C4 [RXBmmmmm] [WvvvvLpp] opcode modrm [disp]
+
+    def _vex3(self, mmmmm: int, pp: int, w: int, vvvv: int,
+              r: int, b: int, L: int):
+        """Emit VEX 3-byte prefix (C4) for reg-reg operations."""
+        R = 0 if (r >= 8) else 1
+        X = 1  # No index register in reg-reg
+        B = 0 if (b >= 8) else 1
+        byte1 = (R << 7) | (X << 6) | (B << 5) | (mmmmm & 0x1F)
+        vvvv_inv = (~vvvv) & 0x0F
+        byte2 = (w << 7) | (vvvv_inv << 3) | (L << 2) | (pp & 0x03)
+        self._emit(0xC4, byte1, byte2)
+
+    def _vex3_mem(self, mmmmm: int, pp: int, w: int, vvvv: int,
+                  r: int, base: int, L: int):
+        """Emit VEX 3-byte prefix for memory operations."""
+        R = 0 if (r >= 8) else 1
+        X = 1  # No index
+        B = 0 if (base >= 8) else 1
+        byte1 = (R << 7) | (X << 6) | (B << 5) | (mmmmm & 0x1F)
+        vvvv_inv = (~vvvv) & 0x0F
+        byte2 = (w << 7) | (vvvv_inv << 3) | (L << 2) | (pp & 0x03)
+        self._emit(0xC4, byte1, byte2)
+
+    def _vex_mem_modrm(self, reg: int, base: int, offset: int):
+        """Emit ModRM + SIB + displacement for VEX memory (no compression)."""
+        needs_sib = (base & 7) == 4
+        rbp_base = (base & 7) == 5
+        if offset == 0 and not rbp_base:
+            self._modrm(0b00, reg, base)
+            if needs_sib:
+                self._emit(0x24)
+        elif -128 <= offset <= 127:
+            self._modrm(0b01, reg, base)
+            if needs_sib:
+                self._emit(0x24)
+            self._emit(offset & 0xFF)
+        else:
+            self._modrm(0b10, reg, base)
+            if needs_sib:
+                self._emit(0x24)
+            self._emit_bytes(struct.pack("<i", offset))
+
+    # ================================================================
+    # VEX-ENCODED YMM INSTRUCTIONS (256-bit)
+    # ================================================================
+
+    def vex_vmovdqu_ymm_mem(self, ymm: int, base: int, offset: int = 0):
+        """VMOVDQU ymm, [base+offset] — VEX.256.F3.0F 6F /r"""
+        self._vex3_mem(0x01, 0x02, 0, 0, ymm, base, 1)
+        self._emit(0x6F)
+        self._vex_mem_modrm(ymm & 7, base, offset)
+
+    def vex_vpshufb_ymm(self, dst: int, src1: int, src2: int):
+        """VPSHUFB ymm,ymm,ymm — VEX.256.66.0F38 00 /r"""
+        self._vex3(0x02, 0x01, 0, src1, dst, src2, 1)
+        self._emit(0x00)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vpand_ymm(self, dst: int, src1: int, src2: int):
+        """VPAND ymm,ymm,ymm — VEX.256.66.0F DB /r"""
+        self._vex3(0x01, 0x01, 0, src1, dst, src2, 1)
+        self._emit(0xDB)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vpsrlw_ymm_imm8(self, dst: int, src: int, count: int):
+        """VPSRLW ymm,ymm,imm8 — VEX.256.66.0F 71 /2 ib"""
+        self._vex3(0x01, 0x01, 0, dst, 2, src, 1)
+        self._emit(0x71)
+        self._modrm(0b11, 2, src & 7)
+        self._emit(count & 0xFF)
+
+    def vex_vpmaddubsw_ymm_mem(self, dst: int, src1: int, base: int, offset: int = 0):
+        """VPMADDUBSW ymm,ymm,[base+offset] — VEX.256.66.0F38 04 /r (mem)."""
+        self._vex3_mem(0x02, 0x01, 0, src1, dst, base, 1)
+        self._emit(0x04)
+        self._vex_mem_modrm(dst & 7, base, offset)
+
+    def vex_vpmovzxbw_ymm_xmm(self, dst: int, src: int):
+        """VPMOVZXBW ymm, xmm — VEX.256.66.0F38 30 /r"""
+        self._vex3(0x02, 0x01, 0, 0, dst, src, 1)
+        self._emit(0x30)
+        self._modrm(0b11, dst & 7, src & 7)
+
+    def vex_vextracti128_xmm_ymm_imm8(self, dst: int, src: int, imm8: int):
+        """VEXTRACTI128 xmm, ymm, imm8 — VEX.256.66.0F3A 39 /r ib"""
+        self._vex3(0x03, 0x01, 0, 0, src, dst, 1)
+        self._emit(0x39)
+        self._modrm(0b11, src & 7, dst & 7)
+        self._emit(imm8 & 0xFF)
+
+    def vex_vinserti128_ymm_ymm_xmm_imm8(self, dst: int, src1: int, src2: int, imm8: int):
+        """VINSERTI128 ymm, ymm, xmm, imm8 — VEX.256.66.0F3A 38 /r ib"""
+        self._vex3(0x03, 0x01, 0, src1, dst, src2, 1)
+        self._emit(0x38)
+        self._modrm(0b11, dst & 7, src2 & 7)
+        self._emit(imm8 & 0xFF)
+
+    def vex_vfmadd231ps_ymm(self, dst: int, src1: int, src2: int):
+        """VFMADD231PS ymm,ymm,ymm — VEX.256.66.0F38.W0 B8 /r"""
+        self._vex3(0x02, 0x01, 0, src1, dst, src2, 1)
+        self._emit(0xB8)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vxorps_ymm(self, dst: int, src1: int, src2: int):
+        """VXORPS ymm,ymm,ymm — VEX.256.0F 57 /r"""
+        self._vex3(0x01, 0x00, 0, src1, dst, src2, 1)
+        self._emit(0x57)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    # ================================================================
+    # VEX-ENCODED XMM INSTRUCTIONS (128-bit)
+    # ================================================================
+
+    def vex_vmovss_xmm_mem(self, xmm: int, base: int, offset: int = 0):
+        """VMOVSS xmm, [mem] — VEX.LIG.F3.0F.WIG 10 /r"""
+        self._vex3_mem(1, 2, 0, 0, xmm, base, 0)
+        self._emit(0x10)
+        self._vex_mem_modrm(xmm, base, offset)
+
+    def vex_vmovd_xmm_reg(self, xmm: int, gpr: int):
+        """VMOVD xmm, r32 — VEX.128.66.0F.W0 6E /r"""
+        self._vex3(1, 1, 0, 0, xmm, gpr, 0)
+        self._emit(0x6E)
+        self._modrm(0b11, xmm & 7, gpr & 7)
+
+    def vex_vcvtph2ps_xmm(self, dst: int, src: int):
+        """VCVTPH2PS xmm, xmm — VEX.128.66.0F38.W0 13 /r (F16C)."""
+        self._vex3(2, 1, 0, 0, dst, src, 0)
+        self._emit(0x13)
+        self._modrm(0b11, dst & 7, src & 7)
+
+    def vex_vbroadcastss_ymm_xmm(self, dst: int, src: int):
+        """VBROADCASTSS ymm,xmm — VEX.256.66.0F38 18 /r"""
+        self._vex3(0x02, 0x01, 0, 0, dst, src, 1)
+        self._emit(0x18)
+        self._modrm(0b11, dst & 7, src & 7)
+
+    def vex_vbroadcastss_xmm_xmm(self, dst: int, src: int):
+        """VBROADCASTSS xmm,xmm — VEX.128.66.0F38 18 /r"""
+        self._vex3(0x02, 0x01, 0, 0, dst, src, 0)
+        self._emit(0x18)
+        self._modrm(0b11, dst & 7, src & 7)
+
+    def vex_vpinsrd_xmm_xmm_reg_imm8(self, dst: int, src1: int, gpr: int, imm8: int):
+        """VPINSRD xmm, xmm, r32, imm8 — VEX.128.66.0F3A.W0 22 /r ib"""
+        self._vex3(3, 1, 0, src1, dst, gpr, 0)
+        self._emit(0x22)
+        self._modrm(0b11, dst & 7, gpr & 7)
+        self._emit(imm8 & 0xFF)
+
+    def vex_vxorps_xmm_xmm_mem(self, dst: int, src1: int, base: int, offset: int = 0):
+        """VXORPS xmm, xmm, [mem] — VEX.128.0F.WIG 57 /r"""
+        self._vex3_mem(1, 0, 0, src1, dst, base, 0)
+        self._emit(0x57)
+        self._vex_mem_modrm(dst, base, offset)
+
+    def vex_vpmaddwd_xmm(self, dst: int, src1: int, src2: int):
+        """VPMADDWD xmm,xmm,xmm — VEX.128.66.0F F5 /r"""
+        self._vex3(0x01, 0x01, 0, src1, dst, src2, 0)
+        self._emit(0xF5)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vcvtdq2ps_xmm(self, dst: int, src: int):
+        """VCVTDQ2PS xmm,xmm — VEX.128.0F 5B /r"""
+        self._vex3(0x01, 0x00, 0, 0, dst, src, 0)
+        self._emit(0x5B)
+        self._modrm(0b11, dst & 7, src & 7)
+
+    def vex_vfmadd231ps_xmm(self, dst: int, src1: int, src2: int):
+        """VFMADD231PS xmm,xmm,xmm — VEX.128.66.0F38.W0 B8 /r"""
+        self._vex3(0x02, 0x01, 0, src1, dst, src2, 0)
+        self._emit(0xB8)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vxorps_xmm(self, dst: int, src1: int, src2: int):
+        """VXORPS xmm,xmm,xmm — VEX.128.0F 57 /r"""
+        self._vex3(0x01, 0x00, 0, src1, dst, src2, 0)
+        self._emit(0x57)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vaddps_xmm(self, dst: int, src1: int, src2: int):
+        """VADDPS xmm,xmm,xmm — VEX.128.0F 58 /r"""
+        self._vex3(0x01, 0x00, 0, src1, dst, src2, 0)
+        self._emit(0x58)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vmovhlps_xmm(self, dst: int, src1: int, src2: int):
+        """VMOVHLPS xmm,xmm,xmm — VEX.128.0F 12 /r"""
+        self._vex3(0x01, 0x00, 0, src1, dst, src2, 0)
+        self._emit(0x12)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    def vex_vmovshdup_xmm(self, dst: int, src: int):
+        """VMOVSHDUP xmm,xmm — VEX.128.F3.0F 16 /r"""
+        self._vex3(0x01, 0x02, 0, 0, dst, src, 0)
+        self._emit(0x16)
+        self._modrm(0b11, dst & 7, src & 7)
+
+    def vphaddw_xmm_xmm_xmm(self, dst: int, src1: int, src2: int):
+        """VPHADDW xmm, xmm, xmm — VEX.128.66.0F38.W0 01 /r (no EVEX)."""
+        rxb = 0xE0
+        if dst >= 8:
+            rxb &= ~0x80
+        if src2 >= 8:
+            rxb &= ~0x20
+        byte2 = rxb | 0x02  # mmmmm=00010 (0F38)
+        vvvv = (~src1 & 0xF) << 3
+        byte3 = vvvv | 0x01  # W=0, L=0, pp=01 (66)
+        self._emit(0xC4, byte2, byte3)
+        self._emit(0x01)
+        self._modrm(0b11, dst & 7, src2 & 7)
+
+    # ================================================================
+    # EVEX YMM INSTRUCTIONS (256-bit, supports YMM0-31)
+    # ================================================================
+
+    def vxorps_ymm_ymm_ymm(self, dst: int, src1: int, src2: int):
+        """VXORPS ymm, ymm, ymm — EVEX.256. Supports YMM0-31."""
+        self._evex(mm=1, pp=0, w=0, vvvv=src1, r=dst, x=0, b=src2, ll=1, reg_reg=True)
+        self._emit(0x57)
+        self._modrm(0b11, dst, src2)
+
+    def vpshufb_ymm(self, dst: int, src1: int, src2: int):
+        """VPSHUFB ymm, ymm, ymm — EVEX.256. Supports YMM0-31."""
+        self._evex(mm=2, pp=1, w=0, vvvv=src1, r=dst, x=0, b=src2, ll=1, reg_reg=True)
+        self._emit(0x00)
+        self._modrm(0b11, dst, src2)
+
+    def vmovdqu_ymm_mem(self, ymm: int, base: int, offset: int = 0):
+        """VMOVDQU32 ymm, [base+offset] — EVEX.256. Supports YMM0-31. disp_n=32."""
+        self._evex(mm=1, pp=2, w=0, vvvv=0, r=ymm, x=0, b=base, ll=1)
+        self._emit(0x6F)
+        self._evex_mem_modrm_sib_disp_n(ymm, base, offset, 32)
+
+    def vmovdqa_ymm_mem(self, ymm: int, base: int, offset: int = 0):
+        """VMOVDQA32 ymm, [base+offset] — EVEX.256. Supports YMM0-31. disp_n=32."""
+        self._evex(mm=1, pp=1, w=0, vvvv=0, r=ymm, x=0, b=base, ll=1)
+        self._emit(0x6F)
+        self._evex_mem_modrm_sib_disp_n(ymm, base, offset, 32)
+
+    def vpbroadcastd_ymm(self, dst: int, src: int):
+        """VPBROADCASTD ymm, reg32 — EVEX.256. Supports YMM0-31."""
+        self._evex(mm=2, pp=1, w=0, vvvv=0, r=dst, x=0, b=src, ll=1, reg_reg=True)
+        self._emit(0x7C)
+        self._modrm(0b11, dst, src)
+
+    def vpaddd_ymm(self, dst: int, src1: int, src2: int):
+        """VPADDD ymm, ymm, ymm — EVEX.256. Supports YMM0-31."""
+        self._evex(mm=1, pp=1, w=0, vvvv=src1, r=dst, x=0, b=src2, ll=1, reg_reg=True)
+        self._emit(0xFE)
+        self._modrm(0b11, dst, src2)
+
+    def vcvtdq2ps_ymm(self, dst: int, src: int):
+        """VCVTDQ2PS ymm, ymm — EVEX.256. Supports YMM0-31."""
+        self._evex(mm=1, pp=0, w=0, vvvv=0, r=dst, x=0, b=src, ll=1, reg_reg=True)
+        self._emit(0x5B)
+        self._modrm(0b11, dst, src)
+
+    # ================================================================
+    # AVX-512 VNNI (YMM, 256-bit)
+    # ================================================================
+
+    def vpdpwssd_ymm_ymm_ymm(self, dst: int, src1: int, src2: int):
+        """
+        VPDPWSSD ymm, ymm, ymm — AVX-512 VNNI multiply-accumulate.
+        dst[i32] += src1[2i:s16]*src2[2i:s16] + src1[2i+1:s16]*src2[2i+1:s16]
+        Replaces VPMADDWD + VPADDD in one instruction.
+        EVEX.256.66.0F38.W0 52 /r. Supports YMM0-31.
+        """
+        self._evex(mm=2, pp=1, w=0, vvvv=src1, r=dst, x=0, b=src2, ll=1, reg_reg=True)
+        self._emit(0x52)
+        self._modrm(0b11, dst, src2)
+
+    # ================================================================
+    # PREFETCH VARIANTS + NOP + LFENCE
+    # ================================================================
+
+    def _prefetch_generic(self, base: int, offset: int, reg_opcode: int):
+        """Helper for PREFETCH variants. reg_opcode: 0=NTA, 1=T0, 2=T1, 3=T2."""
+        if base > 7:
+            self._emit(0x41)
+        self._emit(0x0F, 0x18)
+        needs_sib = (base & 7) == 4
+        rbp_base = (base & 7) == 5
+        if offset == 0 and not rbp_base:
+            self._modrm(0b00, reg_opcode, base)
+            if needs_sib:
+                self._emit(0x24)
+        elif -128 <= offset <= 127:
+            self._modrm(0b01, reg_opcode, base)
+            if needs_sib:
+                self._emit(0x24)
+            self._emit(offset & 0xFF)
+        else:
+            self._modrm(0b10, reg_opcode, base)
+            if needs_sib:
+                self._emit(0x24)
+            self._emit_bytes(struct.pack("<i", offset))
+
+    def prefetchT1_mem(self, base: int, offset: int = 0):
+        """PREFETCHT1 [base + offset] — bring data to L2 cache."""
+        self._prefetch_generic(base, offset, reg_opcode=2)
+
+    def prefetchT2_mem(self, base: int, offset: int = 0):
+        """PREFETCHT2 [base + offset] — bring data to L3 cache."""
+        self._prefetch_generic(base, offset, reg_opcode=3)
+
+    def prefetchNTA_mem(self, base: int, offset: int = 0):
+        """PREFETCHNTA [base + offset] — non-temporal prefetch (no cache pollution)."""
+        self._prefetch_generic(base, offset, reg_opcode=0)
+
+    def lfence(self):
+        """LFENCE — load fence, serializes loads."""
+        self._emit(0x0F, 0xAE, 0xE8)
+
+    def multi_nop(self, size: int):
+        """Variable-size NOP (1-15 bytes). AMD Zen recommended sequences."""
+        nop_table = {
+            1: [0x90],
+            2: [0x66, 0x90],
+            3: [0x0F, 0x1F, 0x00],
+            4: [0x0F, 0x1F, 0x40, 0x00],
+            5: [0x0F, 0x1F, 0x44, 0x00, 0x00],
+            6: [0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00],
+            7: [0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00],
+            8: [0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+            9: [0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00],
+        }
+        size = max(1, min(size, 15))
+        if size <= 9:
+            for b in nop_table[size]:
+                self._emit(b)
+        else:
+            for b in nop_table[9]:
+                self._emit(b)
+            remainder = size - 9
+            if remainder in nop_table:
+                for b in nop_table[remainder]:
+                    self._emit(b)
+            else:
+                for _ in range(remainder):
+                    self._emit(0x90)
+
+    def nop_align(self, alignment: int = 32):
+        """Emit canonical multi-byte NOPs to align next instruction.
+        Uses Intel SDM Vol 2, Table 4-12 NOP sequences."""
+        pos = len(self.code)
+        pad = (alignment - (pos % alignment)) % alignment
+        while pad > 0:
+            n = min(pad, 9)
+            self.multi_nop(n)
+            pad -= n
+
+    # ================================================================
+    # GPR 32-BIT OPERATIONS (no REX.W — zero-extends to 64-bit)
+    # ================================================================
+
+    def mov_reg_mem32(self, dst: int, base: int, offset: int = 0):
+        """MOV r32, [base+offset] — 32-bit load (zero-extends to 64-bit)."""
+        rex = 0x40
+        if dst >= 8:
+            rex |= 0x04
+        if base >= 8:
+            rex |= 0x01
+        if rex != 0x40:
+            self._emit(rex)
+        self._emit(0x8B)
+        if (base & 7) == 4:
+            if offset == 0 and (base & 7) != 5:
+                self._modrm(0b00, dst & 7, 0b100)
+                self._emit(0x24)
+            elif -128 <= offset <= 127:
+                self._modrm(0b01, dst & 7, 0b100)
+                self._emit(0x24)
+                self._emit(offset & 0xFF)
+            else:
+                self._modrm(0b10, dst & 7, 0b100)
+                self._emit(0x24)
+                self._emit_bytes(struct.pack('<i', offset))
+        elif offset == 0 and (base & 7) != 5:
+            self._modrm(0b00, dst & 7, base & 7)
+        elif -128 <= offset <= 127:
+            self._modrm(0b01, dst & 7, base & 7)
+            self._emit(offset & 0xFF)
+        else:
+            self._modrm(0b10, dst & 7, base & 7)
+            self._emit_bytes(struct.pack('<i', offset))
+
+    def movzx_r32_word_mem(self, dst: int, base: int, offset: int = 0):
+        """MOVZX r32, word [base+offset] — 16-bit load, zero-extend to 32."""
+        rex = 0x40
+        if dst >= 8:
+            rex |= 0x04
+        if base >= 8:
+            rex |= 0x01
+        if rex != 0x40:
+            self._emit(rex)
+        self._emit(0x0F, 0xB7)
+        if (base & 7) == 4:
+            if offset == 0 and (base & 7) != 5:
+                self._modrm(0b00, dst & 7, 0b100)
+                self._emit(0x24)
+            elif -128 <= offset <= 127:
+                self._modrm(0b01, dst & 7, 0b100)
+                self._emit(0x24)
+                self._emit(offset & 0xFF)
+            else:
+                self._modrm(0b10, dst & 7, 0b100)
+                self._emit(0x24)
+                self._emit_bytes(struct.pack('<i', offset))
+        elif offset == 0 and (base & 7) != 5:
+            self._modrm(0b00, dst & 7, base & 7)
+        elif -128 <= offset <= 127:
+            self._modrm(0b01, dst & 7, base & 7)
+            self._emit(offset & 0xFF)
+        else:
+            self._modrm(0b10, dst & 7, base & 7)
+            self._emit_bytes(struct.pack('<i', offset))
+
+    def and_reg32_imm32(self, reg: int, value: int):
+        """AND r32, imm32 — 32-bit AND (no REX.W, zero-extends)."""
+        rex = 0x40
+        if reg >= 8:
+            rex |= 0x01
+        if rex != 0x40:
+            self._emit(rex)
+        self._emit(0x81)
+        self._modrm(0b11, 4, reg & 7)
+        self._emit_bytes(struct.pack('<I', value & 0xFFFFFFFF))
+
+    def shr_reg32_imm8(self, reg: int, count: int):
+        """SHR r32, imm8 — 32-bit shift right (no REX.W, zero-extends)."""
+        rex = 0x40
+        if reg >= 8:
+            rex |= 0x01
+        if rex != 0x40:
+            self._emit(rex)
+        self._emit(0xC1)
+        self._modrm(0b11, 5, reg & 7)
+        self._emit(count & 0xFF)
+
+    def or_reg32_reg32(self, dst: int, src: int):
+        """OR r32, r32 — 32-bit OR (no REX.W, zero-extends)."""
+        rex = 0x40
+        if src >= 8:
+            rex |= 0x04
+        if dst >= 8:
+            rex |= 0x01
+        if rex != 0x40:
+            self._emit(rex)
+        self._emit(0x09)
+        self._modrm(0b11, src & 7, dst & 7)
