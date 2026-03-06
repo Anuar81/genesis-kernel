@@ -47,7 +47,8 @@ python hybrid_moe_offload.py --prompt "Explain quicksort in Python"
 - CPU with AVX-512 support (AMD Zen4+, Intel Skylake-X+)
 - NVIDIA GPU with CUDA
 - Python 3.10+
-- `pip install genesis-kernel torch bitsandbytes transformers safetensors huggingface_hub`
+- `pip install -e .` (from genesis-kernel repo root)
+- `pip install torch bitsandbytes transformers safetensors huggingface_hub`
 
 ## How it works
 

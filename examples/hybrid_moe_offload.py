@@ -18,7 +18,8 @@ result vector to GPU. This is ~1000x less data over PCIe:
 Requirements:
   - CPU with AVX-512 (AMD Zen4+, Intel Skylake-X+)
   - NVIDIA GPU with CUDA
-  - pip install genesis-kernel torch bitsandbytes transformers safetensors
+  - pip install -e . (from genesis-kernel repo root)
+  - pip install torch bitsandbytes transformers safetensors
 
 Usage:
   python hybrid_moe_offload.py                          # auto-detect split

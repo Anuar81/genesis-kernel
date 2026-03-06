@@ -10,7 +10,8 @@ Compares dequantization + matrix multiplication performance between:
 Requirements:
   - CPU with AVX-512 support (AMD Zen4+, Intel Skylake-X+)
   - NVIDIA GPU with CUDA
-  - pip install genesis-kernel torch bitsandbytes
+  - pip install -e . (from genesis-kernel repo root)
+  - pip install torch bitsandbytes
 
 Usage: python benchmark_genesis_vs_bnb.py [--M 2048] [--K 1536] [--runs 50]
 """
